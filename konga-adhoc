@@ -1,0 +1,93 @@
+#!/bin/bash
+set -e
+
+function usage() {
+    echo "Usage:" >&2
+    echo "  $0 <kong-namespace> [service] [port]" >&2
+    echo "" >&2
+    echo "  service  - the name of the kong service to connect to (default: kong)" >&2
+    echo "  port     - the port of the kong service (default: 8001)" >&2
+}
+
+CONTEXT=$(kubectl config current-context)
+KONG_NAMESPACE=$1
+KONG_SERVICE=${2:-kong}
+KONG_PORT=${3:-8001}
+
+if [ -z $KONG_NAMESPACE ]; then
+    usage
+    exit 1
+fi
+
+echo Press ENTER to start konga in $CONTEXT, $KONG_NAMESPACE/$KONG_SERVICE:$KONG_PORT
+read
+
+
+kubectl create namespace konga-adhoc
+cat << EOF | kubectl apply -n konga-adhoc -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: konga
+  name: konga
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: konga
+  template:
+    metadata:
+      labels:
+        app: konga
+    spec:
+      initContainers:
+      - image: alpine
+        name: config-writer
+        command: ["/bin/sh"]
+        args:
+        - "-c"
+        - |
+            echo "
+            module.exports = [
+                {
+                    \"name\": \"Kong\",
+                    \"type\": \"default\",
+                    \"kong_admin_url\": \"http://${KONG_SERVICE}.${KONG_NAMESPACE}:${KONG_PORT}\",
+                    \"health_checks\": false,
+                }
+            ]
+            " > /config/connections
+        volumeMounts:
+        - name: config
+          mountPath: /config
+      containers:
+      - image: pantsel/konga
+        name: konga
+        env:
+        - name: NO_AUTH
+          value: "true"
+        - name: KONGA_SEED_KONG_NODE_DATA_SOURCE_FILE
+          value: /config/connections
+        volumeMounts:
+        - name: config
+          mountPath: /config
+      volumes:
+      - name: config
+        emptyDir: {}
+EOF
+
+echo Waiting for konga...
+kubectl wait deployment -n konga-adhoc konga --for condition=Available=True
+sleep 2
+echo Forwarding port 1337 to konga
+kubectl port-forward -n konga-adhoc deployment/konga 1337:1337 >/dev/null &
+echo "*************************************************************"
+echo "           Access konga at http://127.0.0.1:1337             "
+echo "*************************************************************"
+
+echo
+echo "When you're done, press ENTER to remove konga"
+read
+pkill -P $$
+kubectl delete namespace konga-adhoc
